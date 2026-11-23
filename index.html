@@ -53,6 +53,11 @@
       var gh = p.map(function (b, k) { return mod4(b + g[k]); });
       var ar = p.map(function (b, k) { return mod4(b + 3 - g[k]); });
       var S = idx(p), G = idx(gh), A = idx(ar), E = idx(exit);
+      // special rooms (trophy room, workshop, front door) get all six doors, all open
+      [G, A, E].forEach(function (n) {
+        var c = coords(n);
+        for (var a = 0; a < 3; a++) for (var s = 1; s >= -1; s -= 2) edges[edgeIndex(c, a, s)] = rnd(6, 8);
+      });
       var dS = bfs(edges, S), dG = bfs(edges, G), dA = bfs(edges, A);
       if (Math.min(dS[G], dS[A], dS[E], dG[A], dG[E], dA[E]) < 0) continue;      // must be solvable
       // two possible orders (trophy room first or workshop first): a tiny travelling-salesman problem
