@@ -15,7 +15,7 @@
 
    The cottage is 64 rooms: coordinates (x, y, z), each 0-3, wrapping around.
    Every pair of neighbouring rooms shares one door ("edge"), stored as a number 1-8:
-     1-3 = no door, 4 = dial lock, 5 = tripwire, 6-8 = open door.
+     1-3 = no door, 4-5 = puzzle door, 6-8 = open door.
    Harlowe can't read JavaScript variables, so the result is written into a hidden
    (input-box:) on the Begin passage, which Harlowe copies into $layoutData. */
 (function () {
@@ -267,35 +267,291 @@
     if (LEADERBOARD_URL.indexOf("script.google.com") < 0) { out.innerHTML = '<p style="opacity:0.7">(Leaderboard not set up yet.)</p>'; return; }
     out.innerHTML = '<p style="opacity:0.7">Loading leaderboard…</p>';
 
-    // send each escape only once, even if the page is re-shown (for example by Harlowe's undo arrow)
-    var hunt = document.getElementById("ll-data"), key = "ll-sent-" + (hunt ? hunt.textContent.length + ":" + hunt.textContent.slice(0, 400) : "") + dataEl.textContent + score.name;
-    var alreadySent = false;
-    try { alreadySent = sessionStorage.getItem(key) === "1"; } catch (e) {}
+    // Every escape gets its own random run ID, so the board can find *this* run
+    // even if you've played before or someone else uses the same name.
+    // It's remembered for this hunt, so re-showing the page (e.g. Harlowe's undo arrow) doesn't send it twice.
+    var hunt = document.getElementById("ll-data");
+    var key = "ll-run-" + (hunt ? hunt.textContent.length + ":" + hunt.textContent.slice(0, 400) : "") + dataEl.textContent + score.name;
+    var runId = null;
+    try { runId = sessionStorage.getItem(key); } catch (e) {}
+    var alreadySent = !!runId;
+    if (!runId) runId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    score.id = runId;
+
     var send = alreadySent ? Promise.resolve() :
       fetch(LEADERBOARD_URL, { method: "POST", body: JSON.stringify(score) })   // a plain-text body, so no CORS preflight
         .then(function (r) { return r.text(); })
         .catch(function () {})                       // even if the reply can't be read, the row was still written
-        .then(function () { try { sessionStorage.setItem(key, "1"); } catch (e) {} });
+        .then(function () { try { sessionStorage.setItem(key, runId); } catch (e) {} });
 
-    send.then(function () { return fetch(LEADERBOARD_URL); })
+    send.then(function () { return fetch(LEADERBOARD_URL + "?id=" + encodeURIComponent(runId)); })
       .then(function (r) { return r.json(); })
-      .then(function (rows) {
-        var mine = -1;
-        rows.forEach(function (r, i) { if (mine < 0 && String(r.name) === score.name && Number(r.doors) === score.doors && Number(r.shortest) === score.shortest) mine = i; });
+      .then(function (data) {
+        // New Apps Script replies { top: [...], me: { rank, total } }; the old one replied with just the list.
+        var rows = Array.isArray(data) ? data : (data.top || []), me = Array.isArray(data) ? null : data.me;
+        var isMine = function (r) {
+          if (r.id) return r.id === runId;
+          return Array.isArray(data) && String(r.name) === score.name && Number(r.doors) === score.doors && Number(r.shortest) === score.shortest;
+        };
+        var mineAt = -1; rows.forEach(function (r, i) { if (mineAt < 0 && isMine(r)) mineAt = i; });
         var cell = 'style="padding:3px 10px;text-align:left"', html = '<p><b>Leaderboard</b> <span style="opacity:0.7">(score = shortest route ÷ doors you used)</span></p>' +
           '<table style="border-collapse:collapse;font-size:0.9em"><tr style="opacity:0.7"><th ' + cell + '>#</th><th ' + cell + '>Hunter</th><th ' + cell + '>Score</th><th ' + cell + '>Doors</th></tr>';
         rows.forEach(function (r, i) {
-          html += '<tr style="' + (i === mine ? "background:#f5a52433;font-weight:bold" : "") + '"><td ' + cell + '>' + (i + 1) + '</td><td ' + cell + '>' + esc(r.name) + (i === mine ? " (you)" : "") +
+          var mine = i === mineAt;
+          html += '<tr style="' + (mine ? "background:#f5a52433;font-weight:bold" : "") + '"><td ' + cell + '>' + (i + 1) + '</td><td ' + cell + '>' + esc(r.name) + (mine ? " (you)" : "") +
             '</td><td ' + cell + '>' + esc(r.eff) + '%</td><td ' + cell + '>' + esc(r.doors) + ' / ' + esc(r.shortest) + '</td></tr>';
         });
         html += "</table>";
         if (!rows.length) html += '<p style="opacity:0.7">No scores yet.</p>';
-        if (mine < 0) html += '<p>Your score: <b>' + myEff + '%</b>. Not in the top 10 yet. The cottage will be different next time.</p>';
-        else if (mine === 0) html += "<p><b>You're #1!</b></p>";
+        if (mineAt === 0) html += "<p><b>You're #1!</b></p>";
+        else if (mineAt < 0 && me) html += '<p>Your run: <b>#' + me.rank + ' of ' + me.total + '</b> with ' + myEff + '%. The cottage will be different next time.</p>';
+        else if (mineAt < 0) html += '<p>Your score: <b>' + myEff + '%</b>. Not in the top 10 yet.</p>';
         out.innerHTML = html;
       })
       .catch(function () { out.innerHTML = '<p style="opacity:0.7">Couldn\'t reach the leaderboard right now. Your score was ' + myEff + '%.</p>'; });
   };
+
+  /* ---------- Door puzzles ----------
+     Challenge doors (edge types 4 and 5) show one of six puzzles, each built fresh by the code below:
+       maze         shortest path by hand (breadth-first search)
+       lamplighter  breadth-first vs depth-first search order
+       bridges      Euler paths (which room can you start in?)
+       toll         cheapest route vs fewest corridors (Dijkstra)
+       search       binary search: tracks or compass, 31 places, 5 looks
+       scale        ternary search: 9 coins, one heavier, 2 weighings
+     The Challenge passage has two hidden Harlowe links (ll-pass, ll-fail) and a hidden input bound to $pmsg.
+     When the player answers, this writes the message into $pmsg and clicks the matching link. */
+  var pick = function (a) { return a[Math.floor(Math.random() * a.length)]; };
+  var shuffle = function (a) { a = a.slice(); for (var i = a.length - 1; i > 0; i--) { var j = rnd(0, i), t = a[i]; a[i] = a[j]; a[j] = t; } return a; };
+  var ORD = ["", "1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th"];
+  var TXT = 'fill="#ddd" font-family="sans-serif"';
+  var svgWrap = function (w, h, body) { return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + w + ' ' + h + '" style="width:100%;max-width:' + Math.min(w * 1.4, 480) + 'px;display:block;margin:8px 0">' + body + '</svg>'; };
+  var node = function (x, y, label, fill) {
+    return '<circle cx="' + x + '" cy="' + y + '" r="14" fill="' + (fill || "#2a2a2a") + '" stroke="#ddd" stroke-width="1.5"/>' +
+      '<text x="' + x + '" y="' + (y + 5) + '" text-anchor="middle" font-size="14" font-weight="bold" ' + TXT + '>' + label + '</text>';
+  };
+  var edge = function (a, b, extra) { return '<line x1="' + a[0] + '" y1="' + a[1] + '" x2="' + b[0] + '" y2="' + b[1] + '" stroke="#888" stroke-width="2.5"' + (extra || "") + '/>'; };
+  // four distinct numeric answers: the right one, the classic mistake (if any), and near misses
+  var numberChoices = function (right, trap, near) {
+    var set = [right]; if (trap != null && trap !== right) set.push(trap);
+    near.forEach(function (n) { if (set.length < 4 && n > 0 && set.indexOf(n) < 0) set.push(n); });
+    for (var k = 1; set.length < 4; k++) if (set.indexOf(right + k) < 0) set.push(right + k);
+    return shuffle(set).map(function (n) { return { label: String(n), correct: n === right }; });
+  };
+
+  var PUZZLES = {
+    maze: function () {
+      var N = 5, open = {}, key = function (a, b) { return Math.min(a, b) + "-" + Math.max(a, b); };
+      var nb = function (c) { var r = Math.floor(c / N), k = c % N, o = []; if (r > 0) o.push(c - N); if (r < N - 1) o.push(c + N); if (k > 0) o.push(c - 1); if (k < N - 1) o.push(c + 1); return o; };
+      // carve a maze with depth-first search, then knock out 3 extra walls so there are loops
+      var seen = {}, stack = [rnd(0, N * N - 1)]; seen[stack[0]] = true;
+      while (stack.length) {
+        var c = stack[stack.length - 1], fresh = nb(c).filter(function (m) { return !seen[m]; });
+        if (!fresh.length) { stack.pop(); continue; }
+        var m = pick(fresh); open[key(c, m)] = true; seen[m] = true; stack.push(m);
+      }
+      for (var x = 0; x < 3; x++) { var a = rnd(0, N * N - 1); open[key(a, pick(nb(a)))] = true; }
+      var dist = function (s) { var d = {}; d[s] = 0; var q = [s]; while (q.length) { var u = q.shift(); nb(u).forEach(function (v) { if (open[key(u, v)] && !(v in d)) { d[v] = d[u] + 1; q.push(v); } }); } return d; };
+      var s, g, dd;
+      do { s = rnd(0, N * N - 1); g = rnd(0, N * N - 1); dd = dist(s)[g]; } while (!(dd >= 6));
+      var S = 38, body = '<rect x="10" y="10" width="' + N * S + '" height="' + N * S + '" fill="#ffffff08" stroke="#ddd" stroke-width="2.5"/>';
+      for (var c2 = 0; c2 < N * N; c2++) {
+        var r = Math.floor(c2 / N), k = c2 % N, X = 10 + k * S, Y = 10 + r * S;
+        if (k < N - 1 && !open[key(c2, c2 + 1)]) body += '<line x1="' + (X + S) + '" y1="' + Y + '" x2="' + (X + S) + '" y2="' + (Y + S) + '" stroke="#ddd" stroke-width="2.5"/>';
+        if (r < N - 1 && !open[key(c2, c2 + N)]) body += '<line x1="' + X + '" y1="' + (Y + S) + '" x2="' + (X + S) + '" y2="' + (Y + S) + '" stroke="#ddd" stroke-width="2.5"/>';
+        if (c2 === s || c2 === g) body += '<text x="' + (X + S / 2) + '" y="' + (Y + S / 2 + 7) + '" text-anchor="middle" font-size="20" fill="' + (c2 === s ? "#f5a524" : "#5ec8e5") + '" font-family="sans-serif">' + (c2 === s ? "★" : "●") + '</text>';
+      }
+      return { title: "A maze is scratched into the door.",
+        html: svgWrap(N * S + 20, N * S + 20, body),
+        question: "Moving one square at a time and never through a wall, what is the fewest number of moves from ★ to ●?",
+        options: numberChoices(dd, null, [dd + 2, dd - 2, dd + 4, dd + 6]),
+        win: "You trace the route in your head and slide the bolt the right number of notches.",
+        lose: "Wrong count. Tip for next time: mark every square 1 move from ★, then every square 2 moves away, and so on until you reach ●. Try again. " };
+    },
+
+    lamplighter: function () {
+      for (;;) {
+        var labels = shuffle([1, 2, 3, 4, 5, 6, 7, 8, 9]).slice(0, 7), parent = [-1], depth = [0], kids = [[]];
+        for (var i = 1; i < 7; i++) {
+          var ok = []; for (var j = 0; j < i; j++) if (kids[j].length < 3 && depth[j] < 3) ok.push(j);
+          var p = pick(ok); parent.push(p); depth.push(depth[p] + 1); kids.push([]); kids[p].push(i);
+        }
+        var byLabel = function (a, b) { return labels[a] - labels[b]; };
+        kids.forEach(function (k) { k.sort(byLabel); });
+        var bfs = [], q = [0]; while (q.length) { var u = q.shift(); bfs.push(u); q = q.concat(kids[u]); }
+        var dfs = [], walk = function (u) { dfs.push(u); kids[u].forEach(walk); }; walk(0);
+        var ks = [3, 4, 5, 6].filter(function (k) { return bfs[k - 1] !== dfs[k - 1]; });
+        if (!ks.length) continue;
+        var k = pick(ks), breadth = Math.random() < 0.5, order = breadth ? bfs : dfs, other = breadth ? dfs : bfs;
+        // tidy tree layout: leaves get evenly spaced slots, parents sit above the middle of their children
+        var xs = [], slot = 0, place = function (u) { if (!kids[u].length) { xs[u] = slot++; return; } kids[u].forEach(place); xs[u] = (xs[kids[u][0]] + xs[kids[u][kids[u].length - 1]]) / 2; }; place(0);
+        var W = Math.max(slot, 3) * 60 + 20, pos = function (u) { return [30 + xs[u] * 60 + (W - 20 - slot * 60) / 2, 26 + depth[u] * 62]; };
+        var body = ""; for (var u2 = 1; u2 < 7; u2++) body += edge(pos(parent[u2]), pos(u2));
+        for (var u3 = 0; u3 < 7; u3++) body += node(pos(u3)[0], pos(u3)[1], labels[u3], u3 === 0 ? "#6b4d12" : null);
+        var maxDepth = Math.max.apply(null, depth), right = labels[order[k - 1]], trap = labels[other[k - 1]];
+        var opts = [right, trap].concat(shuffle(labels.filter(function (l) { return l !== right && l !== trap && l !== labels[0]; })).slice(0, 2));
+        return { title: "A plaque shows a lamplighter's rounds.",
+          html: svgWrap(W, maxDepth * 62 + 52, body),
+          question: "She starts at room " + labels[0] + " (lit first). " +
+            (breadth ? "She lights <b>every room next to the rooms she has already lit</b> before going any further."
+                     : "She always goes <b>as deep as she can</b>, and only turns back at a dead end.") +
+            " When she has a choice, she takes the lowest number first. Which room does she light " + ORD[k] + "?",
+          options: shuffle(opts).map(function (l) { return { label: "Room " + l, correct: l === right }; }),
+          win: "You picture her route and say the room aloud. The door unlocks.",
+          lose: breadth ? "Not quite. She works outwards in rings, like ripples in water. That's breadth-first search."
+                        : "Not quite. She follows one path all the way to its end before backtracking. Try again. " };
+      }
+    },
+
+    bridges: function () {
+      var L = "ABCDE", P = [[150, 24], [262, 105], [220, 232], [80, 232], [38, 105]], all = [];
+      for (var a = 0; a < 5; a++) for (var b = a + 1; b < 5; b++) all.push([a, b]);
+      for (;;) {
+        var es = shuffle(all).slice(0, rnd(5, 7)), deg = [0, 0, 0, 0, 0], adj = [[], [], [], [], []];
+        es.forEach(function (e) { deg[e[0]]++; deg[e[1]]++; adj[e[0]].push(e[1]); adj[e[1]].push(e[0]); });
+        var seen = { 0: true }, q = [0]; while (q.length) adj[q.shift()].forEach(function (v) { if (!seen[v]) { seen[v] = true; q.push(v); } });
+        var odd = [0, 1, 2, 3, 4].filter(function (v) { return deg[v] % 2; });
+        if (Object.keys(seen).length < 5 || odd.length !== 2) continue;
+        var right = pick(odd), even = [0, 1, 2, 3, 4].filter(function (v) { return deg[v] % 2 === 0; });
+        var body = ""; es.forEach(function (e) { body += edge(P[e[0]], P[e[1]]); });
+        for (var v = 0; v < 5; v++) body += node(P[v][0], P[v][1], L[v]);
+        return { title: "Chalk on the door: rooms and corridors.",
+          html: svgWrap(300, 256, body),
+          question: "Walk through <b>every corridor exactly once</b> (you may pass through a room more than once). Which room could you start in?",
+          options: shuffle([right].concat(even)).map(function (v) { return { label: "Room " + L[v], correct: v === right }; }),
+          win: "You trace the walk with your finger without lifting it. The door unlocks.",
+          lose: "That start can't work. BTW, Euler worked this out in 1736 at the age of 28." };
+      }
+    },
+
+    toll: function () {
+      var P = { S: [30, 100], a: [140, 34], b: [260, 34], c: [140, 166], d: [260, 166], T: [370, 100] };
+      var cand = [["S", "a"], ["S", "c"], ["a", "b"], ["c", "d"], ["b", "T"], ["d", "T"], ["a", "c"], ["b", "d"], pick([["a", "d"], ["c", "b"]])];
+      for (;;) {
+        var es = cand.filter(function () { return Math.random() < 0.7; }).map(function (e) { return [e[0], e[1], rnd(1, 9)]; });
+        var adj = {}; Object.keys(P).forEach(function (n) { adj[n] = []; });
+        es.forEach(function (e) { adj[e[0]].push([e[1], e[2]]); adj[e[1]].push([e[0], e[2]]); });
+        var paths = [], walk = function (u, seen, cost, hops) {
+          if (u === "T") { paths.push({ cost: cost, hops: hops }); return; }
+          adj[u].forEach(function (x) { if (!seen[x[0]]) { seen[x[0]] = true; walk(x[0], seen, cost + x[1], hops + 1); delete seen[x[0]]; } });
+        };
+        walk("S", { S: true }, 0, 0);
+        if (paths.length < 3) continue;
+        var best = Math.min.apply(null, paths.map(function (p) { return p.cost; }));
+        var fewest = Math.min.apply(null, paths.map(function (p) { return p.hops; }));
+        var trap = Math.min.apply(null, paths.filter(function (p) { return p.hops === fewest; }).map(function (p) { return p.cost; }));
+        if (trap <= best) continue;      // the fewest-corridor route must be the expensive one
+        var body = "";
+        es.forEach(function (e) {
+          var A = P[e[0]], B = P[e[1]], mx = (A[0] + B[0]) / 2, my = (A[1] + B[1]) / 2;
+          body += edge(A, B) + '<circle cx="' + mx + '" cy="' + my + '" r="10" fill="#111" stroke="#f5a524"/><text x="' + mx + '" y="' + (my + 4) + '" text-anchor="middle" font-size="12" fill="#f5a524" font-family="sans-serif">' + e[2] + '</text>';
+        });
+        Object.keys(P).forEach(function (n) { body += node(P[n][0], P[n][1], n === "S" || n === "T" ? n : "", n === "S" ? "#6b4d12" : n === "T" ? "#1d4f5c" : null); });
+        return { title: "A toll map is nailed to the door.",
+          html: svgWrap(400, 200, body),
+          question: "Each corridor costs the oil shown. What is the <b>least oil</b> it takes to get from S to T?",
+          options: numberChoices(best, trap, [best + 1, best - 1, best + 2, trap + 1]),
+          win: "You add up the cheapest route. The door accepts your answer.",
+          lose: "Wrong total. The route with the fewest corridors isn't always the cheapest. Try again. " };
+      }
+    },
+
+    search: function () {
+      var tracks = Math.random() < 0.5;
+      return { title: tracks ? "Beyond this door: a long kennel corridor, 31 pens." : "Beyond this door: a cabinet of 31 numbered drawers.",
+        question: tracks ? "Something is hiding in one of the 31 pens. You have <b>5 looks</b>. At each pen you check, you can read which way the fresh tracks lead."
+                         : "The door's iron key is in one of the 31 drawers. You have <b>5 looks</b>. Each drawer you open, your compass needle swings towards the iron.",
+        mount: function (el, finish) {
+          var lo = 1, hi = 31, looks = 5, log = [];
+          var draw = function () {
+            var h = '<div style="display:flex;flex-wrap:wrap;gap:4px;max-width:520px;margin:8px 0">';
+            for (var i = 1; i <= 31; i++) h += '<button class="ll-pz-btn" data-n="' + i + '" style="width:38px;padding:4px 0;border-radius:5px;border:1px solid #ffffff40;background:' + (i < lo || i > hi ? "#ffffff05;color:#666" : "#ffffff14;color:#ddd") + ';cursor:pointer">' + i + '</button>';
+            el.innerHTML = h + '</div><p>Looks left: <b>' + looks + '</b></p><p style="opacity:0.85">' + log.join("<br>") + '</p>';
+          };
+          draw();
+          el.addEventListener("click", function (e) {
+            var n = +(e.target.getAttribute && e.target.getAttribute("data-n")); if (!n || !looks) return;
+            looks--;
+            if (lo === hi && n === lo) return finish(true, tracks ? "There it is, cornered in pen " + n + ". You slip past while it cowers." : "Drawer " + n + ": the iron key. The door unlocks.");
+            var dir;
+            if (n < lo) dir = "right"; else if (n > hi) dir = "left";
+            else { var left = n - lo, right = hi - n; dir = left > right ? "left" : right > left ? "right" : pick(["left", "right"]); if (dir === "left") hi = n - 1; else lo = n + 1; }
+            log.push(tracks ? "Pen " + n + ": empty. The tracks lead <b>" + dir + "</b>." : "Drawer " + n + ": empty. The needle swings <b>" + dir + "</b>.");
+            if (!looks) return finish(false, "Out of looks. Try again. ");
+            draw();
+          });
+        } };
+    },
+
+    scale: function () {
+      return { title: "Nine brass coins sit beside a set of scales.",
+        question: "One coin is heavier: it's the counterweight that opens the latch. You may use the scales <b>twice</b>, then you must pick the heavy coin. Click a coin to put it on the left pan, again for the right pan, again to take it off.",
+        mount: function (el, finish) {
+          var cand = [1, 2, 3, 4, 5, 6, 7, 8, 9], pan = {}, weighings = 0, log = [], note = "";
+          var draw = function () {
+            var h = '<div style="display:flex;flex-wrap:wrap;gap:6px;margin:8px 0">';
+            for (var i = 1; i <= 9; i++) {
+              var where = pan[i] || "", bg = where === "L" ? "#3e63dd55" : where === "R" ? "#e5484d55" : "#ffffff14";
+              h += '<button class="ll-pz-btn" data-c="' + i + '" style="width:54px;padding:6px 0;border-radius:50%;border:1px solid #c9a227;background:' + bg + ';color:#ddd;cursor:pointer">' + i + (where ? " " + where : "") + '</button>';
+            }
+            var L = Object.keys(pan).filter(function (c) { return pan[c] === "L"; }), R = Object.keys(pan).filter(function (c) { return pan[c] === "R"; });
+            h += '</div><p>Left pan: ' + (L.join(", ") || "empty") + ' · Right pan: ' + (R.join(", ") || "empty") + '</p>';
+            h += weighings < 2 ? '<button class="ll-pz-weigh" style="padding:4px 12px;border-radius:6px;border:1px solid #ffffff40;background:#ffffff14;color:#ddd;cursor:pointer">Weigh (' + (2 - weighings) + ' left)</button>'
+                               : '<p><b>Now click the heavy coin.</b></p>';
+            el.innerHTML = h + '<p style="color:#e5484d">' + note + '</p><p style="opacity:0.85">' + log.join("<br>") + '</p>';
+          };
+          draw();
+          el.addEventListener("click", function (e) {
+            var t = e.target, c = t.getAttribute && t.getAttribute("data-c");
+            note = "";
+            if (c && weighings < 2) { pan[c] = !pan[c] ? "L" : pan[c] === "L" ? "R" : undefined; if (!pan[c]) delete pan[c]; return draw(); }
+            if (c && weighings === 2) {
+              c = +c;
+              if (cand.length === 1 && cand[0] === c) return finish(true, "Coin " + c + " is heavier. You set it in the latch and the door swings open.");
+              return finish(false, "Wrong coin. Try again. ");
+            }
+            if (t.classList && t.classList.contains("ll-pz-weigh")) {
+              var L = [], R = []; Object.keys(pan).forEach(function (k) { (pan[k] === "L" ? L : R).push(+k); });
+              if (!L.length || L.length !== R.length) { note = "Put the same number of coins (at least one) on each pan."; return draw(); }
+              var inL = cand.filter(function (x) { return L.indexOf(x) >= 0; }), inR = cand.filter(function (x) { return R.indexOf(x) >= 0; }), off = cand.filter(function (x) { return L.indexOf(x) < 0 && R.indexOf(x) < 0; });
+              var outcomes = [["left", inL], ["right", inR], ["balanced", off]], most = Math.max(inL.length, inR.length, off.length);
+              var o = pick(outcomes.filter(function (x) { return x[1].length === most; }));
+              cand = o[1]; weighings++;
+              log.push("Weighing " + weighings + ": " + L.join(", ") + " against " + R.join(", ") + ". " + (o[0] === "balanced" ? "The scales <b>balance</b>." : "The <b>" + o[0] + "</b> pan drops."));
+              pan = {}; draw();
+            }
+          });
+        } };
+    }
+  };
+
+  window.lamplightPuzzle = function () {
+    var box = document.getElementById("ll-puzzle");
+    if (!box || box.dataset.done) return;
+    box.dataset.done = "1";
+    ["click", "keydown", "mousedown"].forEach(function (ev) { box.addEventListener(ev, function (e) { e.stopPropagation(); }); });
+    var kind = window.LL_FORCE_PUZZLE || pick(Object.keys(PUZZLES)), pz = PUZZLES[kind]();
+    var finish = function (pass, msg) {
+      var hook = document.querySelector('tw-hook[name="pzbridge"]');
+      var input = hook.querySelector("textarea, input");
+      input.value = msg; input.dispatchEvent(new Event("input", { bubbles: true }));
+      var links = hook.querySelectorAll("tw-link");
+      for (var i = 0; i < links.length; i++) if (links[i].textContent.trim() === (pass ? "ll-pass" : "ll-fail")) { links[i].click(); return; }
+    };
+    box.innerHTML = "<p><b>" + pz.title + "</b></p>" + (pz.html || "") + "<p>" + pz.question + "</p><div class='ll-pz-area'></div>";
+    var area = box.querySelector(".ll-pz-area");
+    window.lamplightPuzzleKind = kind;
+    if (pz.mount) return pz.mount(area, finish);
+    window.lamplightPuzzleAnswer = pz.options.filter(function (o) { return o.correct; })[0].label;   // used by the automated tests
+    area.innerHTML = '<div style="display:flex;flex-wrap:wrap;gap:6px">' + pz.options.map(function (o, i) {
+      return '<button data-i="' + i + '" style="padding:5px 14px;border-radius:6px;border:1px solid #ffffff40;background:#ffffff14;color:#ddd;cursor:pointer">' + o.label + '</button>';
+    }).join("") + "</div>";
+    area.addEventListener("click", function (e) {
+      var i = e.target.getAttribute && e.target.getAttribute("data-i"); if (i == null) return;
+      var o = pz.options[+i]; finish(o.correct, o.correct ? pz.win : pz.lose);
+    });
+  };
+  window.LL_PUZZLES = PUZZLES;   // exposed so the generators can be tested
 
   window.lamplightLayout = generate();
   window.lamplightFill = function () {
@@ -313,7 +569,7 @@
 (set: $powerText to (dm:
   &quot;Tracker&#39;s Eye&quot;, &quot;You read signs other people walk past. Every door shows which lamp it will change.&quot;,
   &quot;Deep Lantern&quot;, &quot;You packed extra oil. Your lantern lasts 8 doors longer.&quot;,
-  &quot;Skeleton Kit&quot;, &quot;Picks, cutters and a coil of wire. Gets you past 3 jammed or trapped doors without a struggle.&quot;,
+  &quot;Skeleton Kit&quot;, &quot;Picks, cutters and a coil of wire. Gets you past 3 puzzle doors without solving them.&quot;,
   &quot;None&quot;, &quot;Just you and your wits.&quot;))
 }You are a professional hunter. For three days you have tracked a white stag through the forest, and this evening its trail ended at a cottage in the middle of the woods. One room, one chimney, door ajar.
 
@@ -337,24 +593,10 @@ Before you set out, you packed one piece of gear:
   (set: $power to $powers&#39;s (($clicks % 4) + 1))
   (set: $hero to (dm: &quot;Name&quot;, $Input, &quot;Power&quot;, $power))
   (go-to: &quot;Start&quot;)
-]]</tw-passagedata><tw-passagedata pid="2" name="Challenge" tags="" position="550,100" size="100,100">{
-(set: $dm to $map&#39;s ($door))
-(set: $ec to $p, $ea to $dm&#39;s 1st, $es to $dm&#39;s 2nd)(display: &quot;EdgeOf&quot;)
-(set: $miss to (random: 0, 3))
-(set: $high to (either: true, false))
-}(if: $power is &quot;Skeleton Kit&quot; and $kit &gt; 0)[&#39;&#39;$door.&#39;&#39; You kneel, open your kit and work the mechanism loose. ($kit uses left before this one.)
+]]</tw-passagedata><tw-passagedata pid="2" name="Challenge" tags="" position="550,100" size="100,100">{(set: $pmsg to &quot;&quot;)}(if: $power is &quot;Skeleton Kit&quot; and $kit &gt; 0)[&#39;&#39;$door.&#39;&#39; A puzzle bars the way, but you kneel, open your kit and work the mechanism loose. ($kit uses left before this one.)
 
-(link: &quot;Go through&quot;)[(set: $kit to it - 1)(set: $pre to &quot;Your kit makes short work of it. &quot;)(go-to: &quot;Move&quot;)]](else-if: $et is 4)[&#39;&#39;$door.&#39;&#39; The handle is locked by a brass dial set with a ring of four glass beads. One bead is missing:
-
-(for: each _k, 0, 1, 2, 3)[(if: _k is $miss)[ ◯ ? ](else:)[(set: $ci to $perm&#39;s (_k + 1))(text-colour: $hex&#39;s ($ci))[ ■ (print: $names&#39;s ($ci))]]]
-
-Which bead completes the ring?
-
-(for: each _k, ...(shuffled: 0, 1, 2, 3))[(link: &quot;Press &quot; + $names&#39;s ($perm&#39;s (_k + 1)))[(if: _k is $miss)[(set: $pre to &quot;The dial clicks and the door swings open. &quot;)(go-to: &quot;Move&quot;)](else:)[(set: $msg to &quot;The dial jams and spits a puff of soot. You burn 2 doors&#39; worth of oil prising it back.&quot;)(go-to: &quot;Penalty&quot;)]]
-]](else:)[&#39;&#39;$door.&#39;&#39; (if: $high)[A wire is strung across the doorway at chest height, beaded with dew.](else:)[A wire is strung across the doorway at ankle height, almost invisible against the floorboards.] You know this kind of snare. You&#39;ve set hundreds.
-
-(link: &quot;Step over it&quot;)[(if: not $high)[(set: $pre to &quot;You step over the wire without touching it. &quot;)(go-to: &quot;Move&quot;)](else:)[(set: $msg to &quot;Your shoulder catches the wire. A net drops, and it takes 2 doors&#39; worth of oil to cut yourself free.&quot;)(go-to: &quot;Penalty&quot;)]]
-(link: &quot;Duck under it&quot;)[(if: $high)[(set: $pre to &quot;You duck under the wire without touching it. &quot;)(go-to: &quot;Move&quot;)](else:)[(set: $msg to &quot;Your knee catches the wire. A net drops, and it takes 2 doors&#39; worth of oil to cut yourself free.&quot;)(go-to: &quot;Penalty&quot;)]]]
+(link: &quot;Go through&quot;)[(set: $kit to it - 1)(set: $pre to &quot;Your kit makes short work of it. &quot;)(go-to: &quot;Move&quot;)]](else:)[&#39;&#39;$door.&#39;&#39;
+&lt;div id=&quot;ll-puzzle&quot;&gt;&lt;/div&gt;|pzbridge&gt;[(css: &quot;display:none&quot;)[(input-box: bind $pmsg)(link: &quot;ll-pass&quot;)[(set: $pre to $pmsg + &quot; &quot;)(go-to: &quot;Move&quot;)](link: &quot;ll-fail&quot;)[(set: $msg to $pmsg)(go-to: &quot;Penalty&quot;)]]]&lt;script&gt;setTimeout(function () { window.lamplightPuzzle(); }, 30)&lt;/script&gt;]
 
 (link: &quot;Back away&quot;)[(go-to: &quot;Room&quot;)]</tw-passagedata><tw-passagedata pid="3" name="Death" tags="" position="850,100" size="100,100">{(set: $ending to &quot;death&quot;)}Your lantern gutters, flares once, and goes out.
 
@@ -426,8 +668,7 @@ Lantern oil: &#39;&#39;(print: $limit - $rooms) doors&#39;&#39;(if: $limit - $ro
   (set: $dm to $map&#39;s (_d))
   (set: $ec to $p, $ea to $dm&#39;s 1st, $es to $dm&#39;s 2nd)(display: &quot;EdgeOf&quot;)
   (set: _hint to (cond: $power is &quot;Tracker&#39;s Eye&quot;, &quot; (moves the &quot; + $pos&#39;s ($lpos&#39;s ($dm&#39;s 1st)) + &quot; lamp)&quot;, &quot;&quot;))
-  (if: $et is 4)[(link: _d + &quot;, locked with a coloured dial&quot; + _hint)[(set: $door to _d)(go-to: &quot;Challenge&quot;)]&lt;br&gt;]
-  (else-if: $et is 5)[(link: _d + &quot;, a wire glints across it&quot; + _hint)[(set: $door to _d)(go-to: &quot;Challenge&quot;)]&lt;br&gt;]
+  (if: $et is 4 or $et is 5)[(link: _d + &quot;, sealed by a puzzle&quot; + _hint)[(set: $door to _d)(go-to: &quot;Challenge&quot;)]&lt;br&gt;]
   (else-if: $et &gt;= 6)[(link: _d + _hint)[(set: $door to _d)(go-to: &quot;Move&quot;)]&lt;br&gt;]
 ]}
 (if: $debug)[&#39;&#39;Debug:&#39;&#39; at (print: $p), trophy (print: $gh), workshop (print: $ar), exit (print: $exit), best route $opt, limit $limit]</tw-passagedata><tw-passagedata pid="9" name="ShowLamps" tags="" position="400,250" size="100,100">{(for: each _j, 1, 2, 3)[
